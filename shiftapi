@@ -24,36 +24,53 @@ def login_to_cluster(cluster):
     else:
         print(f"Login successful for {cluster}")
 
+import json  # Add at the top if not already
+
 def get_deployments_info(cluster):
     login_to_cluster(cluster)
     namespace = CLUSTERS[cluster]["namespace"]
 
     cmd = [
-        "oc", "get", "deployments", "-n", namespace, "-o",
-        "jsonpath={range .items[*]}{\"name\":\"{.metadata.name}\",\"image\":\"{.spec.template.spec.containers[*].image}\",\"ready\":\"{.status.readyReplicas}/{.status.replicas}\"}\\n{end}"
+        "oc", "get", "deployments", "-n", namespace, "-o", "json"
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     deployments = []
     if result.returncode == 0:
-        for line in result.stdout.strip().split('\n'):
-            deployment = eval(line)
-            # Fetch the route
-            route_cmd = [
-                "oc", "get", "route", "-n", namespace, "-l", f"app={deployment['name']}",
-                "-o", "jsonpath={.items[0].spec.host}"
-            ]
-            route_result = subprocess.run(route_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if route_result.returncode == 0 and route_result.stdout.strip():
-                deployment["route"] = f"http://{route_result.stdout.strip()}"
-            else:
-                deployment["route"] = None
+        try:
+            deployments_data = json.loads(result.stdout)
+            for item in deployments_data.get('items', []):
+                name = item['metadata']['name']
+                images = [container['image'] for container in item['spec']['template']['spec']['containers']]
+                ready_replicas = item['status'].get('readyReplicas', 0)
+                total_replicas = item['status'].get('replicas', 0)
 
-            deployments.append(deployment)
+                deployment = {
+                    "name": name,
+                    "image": ",".join(images),
+                    "ready": f"{ready_replicas}/{total_replicas}"
+                }
+
+                # Fetch the route for the deployment
+                route_cmd = [
+                    "oc", "get", "route", "-n", namespace, "-l", f"app={name}",
+                    "-o", "jsonpath={.items[0].spec.host}"
+                ]
+                route_result = subprocess.run(route_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if route_result.returncode == 0 and route_result.stdout.strip():
+                    deployment["route"] = f"http://{route_result.stdout.strip()}"
+                else:
+                    deployment["route"] = None
+
+                deployments.append(deployment)
+
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON output: {str(e)}")
     else:
         print(f"Error executing command: {result.stderr}")
 
     return deployments
+
 
 
 def get_all_pods_logs(cluster, deployment_name, timeout=30):
