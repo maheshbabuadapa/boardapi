@@ -1,0 +1,120 @@
+from flask import Flask, jsonify
+import subprocess
+
+app = Flask(__name__)
+
+CLUSTERS = {
+    "dev": {"url": "https://dev-openshift-cluster-url:6443", "username": "dev-username", "password": "dev-password", "namespace": "dev-namespace"},
+    "sit": {"url": "https://sit-openshift-cluster-url:6443", "username": "sit-username", "password": "sit-password", "namespace": "sit-namespace"},
+    "uat": {"url": "https://uat-openshift-cluster-url:6443", "username": "uat-username", "password": "uat-password", "namespace": "uat-namespace"},
+    "preprod": {"url": "https://preprod-openshift-cluster-url:6443", "username": "preprod-username", "password": "preprod-password", "namespace": "preprod-namespace"}
+}
+
+def login_to_cluster(cluster):
+    cluster_info = CLUSTERS[cluster]
+    login_cmd = [
+        "oc", "login", cluster_info["url"],
+        "-u", cluster_info["username"],
+        "-p", cluster_info["password"],
+        "--insecure-skip-tls-verify=true"
+    ]
+    result = subprocess.run(login_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Login failed: {result.stderr}")
+    else:
+        print(f"Login successful for {cluster}")
+
+def get_deployments_info(cluster):
+    login_to_cluster(cluster)
+    namespace = CLUSTERS[cluster]["namespace"]
+
+    cmd = [
+        "oc", "get", "deployments", "-n", namespace, "-o",
+        "jsonpath={range .items[*]}{'{"name":"' + .metadata.name + '","image":"' + .spec.template.spec.containers[*].image + '","ready":"' + ( .status.readyReplicas | tostring ) + '/' + ( .status.replicas | tostring ) + '"}\n'}{end}"
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    deployments = []
+    if result.returncode == 0:
+        for line in result.stdout.strip().split('\n'):
+            deployment = eval(line)
+            # Now fetch the route for each deployment
+            route_cmd = [
+                "oc", "get", "route", "-n", namespace, "-l", f"app={deployment['name']}",
+                "-o", "jsonpath={.items[0].spec.host}"
+            ]
+            route_result = subprocess.run(route_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if route_result.returncode == 0 and route_result.stdout.strip():
+                deployment["route"] = f"http://{route_result.stdout.strip()}"
+            else:
+                deployment["route"] = None
+
+            deployments.append(deployment)
+    else:
+        print(f"Error executing command: {result.stderr}")
+
+    return deployments
+
+def get_all_pods_logs(cluster, deployment_name, timeout=30):
+    try:
+        login_to_cluster(cluster)
+        namespace = CLUSTERS[cluster]["namespace"]
+
+        get_pods_cmd = [
+            "oc", "get", "pods", "-n", namespace, "-l", f"app={deployment_name}",
+            "-o", "jsonpath={.items[*].metadata.name}"
+        ]
+        pod_result = subprocess.run(
+            get_pods_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+
+        if pod_result.returncode != 0:
+            return f"Error fetching pod names: {pod_result.stderr}"
+
+        pod_names = pod_result.stdout.strip().split()
+
+        if not pod_names:
+            return f"No pods found for deployment '{deployment_name}' in namespace '{namespace}'."
+
+        logs = {}
+        for pod_name in pod_names:
+            logs_cmd = ["oc", "logs", pod_name, "-n", namespace]
+            logs_result = subprocess.run(
+                logs_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout
+            )
+            if logs_result.returncode == 0:
+                logs[pod_name] = logs_result.stdout
+            else:
+                logs[pod_name] = f"Error fetching logs: {logs_result.stderr}"
+
+        return logs
+
+    except subprocess.TimeoutExpired:
+        return "Command timed out."
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+@app.route('/<env>')
+def deployments_info(env):
+    if env not in CLUSTERS:
+        return jsonify({"error": "Environment not found"}), 404
+    deployments = get_deployments_info(env)
+    return jsonify(deployments)
+
+@app.route('/<env>-logs/<deployment_name>')
+def deployment_logs(env, deployment_name):
+    if env not in CLUSTERS:
+        return jsonify({"error": "Environment not found"}), 404
+    logs = get_all_pods_logs(env, deployment_name)
+    return jsonify({"deployment": deployment_name, "logs": logs})
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
